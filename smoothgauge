@@ -1,0 +1,170 @@
+import numpy as np
+from vaspwfc import vaspwfc
+from scipy.linalg import svd
+
+def read_wavecar(filename='WAVECAR'):
+    """Read wavefunctions from WAVECAR file including spin"""
+    wav = vaspwfc(filename)
+    nkpts = wav._nkpts
+    nbands = wav._nbands
+    nspin = wav._nspin  # Number of spin components
+    
+    u_nk = []  # Shape: (nspin, nkpts, nbands, nplane_waves)
+    energies = []  # Shape: (nspin, nkpts, nbands)
+    
+    for ispin in range(nspin):
+        u_k_spin = []
+        e_k_spin = []
+        for ik in range(nkpts):
+            u_k = wav.wfc_k(ik, band=None, spin=ispin)
+            e_k = wav.get_eigenvalues(ik, spin=ispin)
+            u_k_spin.append(u_k)
+            e_k_spin.append(e_k)
+        u_nk.append(u_k_spin)
+        energies.append(e_k_spin)
+    
+    kpts = wav._kvecs
+    return u_nk, energies, kpts, nkpts, nbands, nspin
+
+def maximum_overlap_reorder(u_k, u_kq, threshold=0.75):
+    """Optimized band reordering with threshold"""
+    nbands = u_k.shape[0]
+    overlap = np.abs(np.dot(u_k.conj().T, u_kq))
+    
+    # First pass: identify bands with large overlap (> threshold)
+    new_order = [-1] * nbands
+    used_k = set()
+    used_kq = set()
+    
+    for i in range(nbands):
+        if i in used_k:
+            continue
+        max_overlap = np.max(overlap[i, ~np.isin(np.arange(nbands), list(used_kq))])
+        if max_overlap > threshold:
+            j = np.argmax(overlap[i, ~np.isin(np.arange(nbands), list(used_kq))])
+            new_order[i] = j
+            used_k.add(i)
+            used_kq.add(j)
+    
+    # Second pass: remaining bands with maximum overlap
+    remaining_k = [i for i in range(nbands) if i not in used_k]
+    remaining_kq = [i for i in range(nbands) if i not in used_kq]
+    
+    if remaining_k:
+        sub_overlap = overlap[np.ix_(remaining_k, remaining_kq)]
+        while remaining_k:
+            i_idx, j_idx = np.unravel_index(np.argmax(sub_overlap), sub_overlap.shape)
+            i = remaining_k[i_idx]
+            j = remaining_kq[j_idx]
+            new_order[i] = j
+            remaining_k.pop(i_idx)
+            remaining_kq.pop(j_idx)
+            sub_overlap = np.delete(sub_overlap, i_idx, axis=0)
+            sub_overlap = np.delete(sub_overlap, j_idx, axis=1)
+    
+    return u_kq[new_order]
+
+def find_degenerate_groups(energies, threshold=1e-4):
+    """Identify degenerate bands based on energies"""
+    nbands = len(energies)
+    groups = []
+    current_group = [0]
+    
+    for i in range(1, nbands):
+        if abs(energies[i] - energies[i-1]) < threshold:
+            current_group.append(i)
+        else:
+            groups.append(current_group)
+            current_group = [i]
+    groups.append(current_group)
+    
+    return groups
+
+def align_phases(u_k, u_kq, energies_k, energies_kq, degeneracy_threshold=1e-4):
+    """Align phases using SVD on degenerate groups"""
+    nbands = u_k.shape[0]
+    
+    # Find degenerate groups
+    groups_k = find_degenerate_groups(energies_k, degeneracy_threshold)
+    groups_kq = find_degenerate_groups(energies_kq, degeneracy_threshold)
+    
+    u_kq_aligned = np.zeros_like(u_kq)
+    
+    # Process each degenerate group
+    k_start = 0
+    kq_start = 0
+    for g_k, g_kq in zip(groups_k, groups_kq):
+        if len(g_k) != len(g_kq):  # Check if groups match
+            raise ValueError("Degenerate group sizes don't match between k and k+q")
+            
+        u_k_group = u_k[g_k]
+        u_kq_group = u_kq[g_kq]
+        
+        # Calculate overlap for this group
+        S = np.dot(u_k_group.conj().T, u_kq_group)
+        U, s, Vh = svd(S)
+        U_transform = np.dot(U, Vh)
+        
+        # Apply transformation
+        u_kq_aligned[g_kq] = np.dot(u_kq_group, U_transform.T)
+        
+        k_start += len(g_k)
+        kq_start += len(g_kq)
+    
+    return u_kq_aligned
+
+def calculate_derivative(u_nk, energies, kpts, nkpts, nbands, nspin):
+    """Calculate ∂_k u_nk using central difference"""
+    derivatives = [[] for _ in range(nspin)]
+    q_vectors = []
+    
+    for i in range(nkpts):
+        k_current = kpts[i]
+        distances = [np.linalg.norm(k_current - kpts[j]) 
+                    for j in range(nkpts) if j != i]
+        min_dist_idx = np.argmin(distances)
+        q = kpts[min_dist_idx] - k_current
+        q_vectors.append(q)
+    
+    for ispin in range(nspin):
+        for ik in range(nkpts):
+            k = kpts[ik]
+            q = q_vectors[ik]
+            
+            k_plus_q = k + q
+            k_minus_q = k - q
+            
+            idx_kpq = np.argmin([np.linalg.norm(kpq - k_plus_q) 
+                              for kpq in kpts])
+            idx_kmq = np.argmin([np.linalg.norm(kmq - k_minus_q) 
+                              for kmq in kpts])
+            
+            u_k = u_nk[ispin][ik]
+            u_kpq = u_nk[ispin][idx_kpq]
+            u_kmq = u_nk[ispin][idx_kmq]
+            e_k = energies[ispin][ik]
+            e_kpq = energies[ispin][idx_kpq]
+            e_kmq = energies[ispin][idx_kmq]
+            
+            # Reorder and align phases
+            u_kpq_reordered = maximum_overlap_reorder(u_k, u_kpq)
+            u_kmq_reordered = maximum_overlap_reorder(u_k, u_kmq)
+            
+            u_kpq_aligned = align_phases(u_k, u_kpq_reordered, e_k, e_kpq)
+            u_kmq_aligned = align_phases(u_k, u_kmq_reordered, e_k, e_kmq)
+            
+            # Central difference
+            q_norm = np.linalg.norm(q)
+            du_dk = (u_kpq_aligned - u_kmq_aligned) / (2 * q_norm)
+            
+            derivatives[ispin].append(du_dk)
+    
+    return derivatives
+
+def main():
+    u_nk, energies, kpts, nkpts, nbands, nspin = read_wavecar()
+    derivatives = calculate_derivative(u_nk, energies, kpts, nkpts, nbands, nspin)
+    return derivatives
+
+if __name__ == "__main__":
+    derivatives = main()
